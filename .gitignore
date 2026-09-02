@@ -1,0 +1,8 @@
+# 本地备份输出，绝不要提交
+Claude_Backup/
+backup-*/
+
+# 杂项
+*.log
+.DS_Store
+Thumbs.db
