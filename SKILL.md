@@ -13,7 +13,7 @@ Claude 封号后的本机环境重置 + 个人数据保全。**先备份，没�
 
 ## 环境要求
 - Windows + Git Bash + python（脚本用 python 处理 SQLite/JSON）
-- 备份默认写到 `~/Claude_Backup`（即 `%USERPROFILE%\Claude_Backup`），可用环境变量 `BACKUP_ROOT` 改到别的盘（如 `BACKUP_ROOT=/e/Claude_Backup bash scripts/claude-reset.sh backup`）
+- 备份默认写到 `~/Claude_Backup`（即 `%USERPROFILE%\Claude_Backup`），可用环境变量 `BACKUP_ROOT` 改到别的盘（如 `BACKUP_ROOT=/e/Claude_Backup bash scripts/whack-a-claude.sh backup`）
 - 痕迹清单是 Claude 官方安装的标准默认路径；换台机器先核对一遍再跑（官方脚本装的在 `~/.local`，npm 装的路径不同）
 
 ## Golden rules
@@ -34,15 +34,15 @@ Claude 封号后的本机环境重置 + 个人数据保全。**先备份，没�
 ## 工作流（脚本逐阶段执行）
 ```bash
 # 0. 先核对环境：tasklist 确认无 claude 进程在跑
-bash scripts/claude-reset.sh backup      # 1. 备份到 $BACKUP_ROOT\backup-<时间戳>\，输出摘要
-bash scripts/claude-reset.sh browser     # 2. 清 Chrome/Edge 的 claude 站点数据（会要求关闭浏览器）
-bash scripts/claude-reset.sh uninstall   # 3. 卸载桌面版（MSIX）
-bash scripts/claude-reset.sh delete      # 4. 删除 CLI + 桌面版全部残留（需输入 YES）
-bash scripts/claude-reset.sh install     # 5. 装最新 CLI（install.ps1；失败走 npm 兜底）
-bash scripts/claude-reset.sh restore     # 6. 还原备份 + 生成净化版 .claude.json
-bash scripts/claude-reset.sh verify      # 7. 验证 + 打印重新注册注意事项
+bash scripts/whack-a-claude.sh backup      # 1. 备份到 $BACKUP_ROOT\backup-<时间戳>\，输出摘要
+bash scripts/whack-a-claude.sh browser     # 2. 清 Chrome/Edge 的 claude 站点数据（会要求关闭浏览器）
+bash scripts/whack-a-claude.sh uninstall   # 3. 卸载桌面版（MSIX）
+bash scripts/whack-a-claude.sh delete      # 4. 删除 CLI + 桌面版全部残留（需输入 YES）
+bash scripts/whack-a-claude.sh install     # 5. 装最新 CLI（pwsh 跑 install.ps1 → npmmirror 镜像 → npm 三级兜底）
+bash scripts/whack-a-claude.sh restore     # 6. 还原备份 + 生成净化版 .claude.json
+bash scripts/whack-a-claude.sh verify      # 7. 验证 + 打印重新注册注意事项
 ```
-也可 `bash scripts/claude-reset.sh all` 一把梭（delete 前仍会要求输入 YES）。
+也可 `bash scripts/whack-a-claude.sh all` 一把梭（delete 前仍会要求输入 YES）。
 
 ## 备份内容（全部经核实可安全恢复）
 | 内容 | 来源 | 说明 |
@@ -89,7 +89,7 @@ bash scripts/claude-reset.sh verify      # 7. 验证 + 打印重新注册注意�
 - 若想让 Claude Code 也拥有本 skill：restore 后 `cp -r ~/.agents/skills/whack-a-claude ~/.claude/skills/`
 
 ## 已知坑
-- `install.ps1` 需要能连 claude.ai，网络不通时先挂代理，或脚本自动走 npm 兜底（npm 版路径不同，verify 会提示）
+- install 三级兜底：pwsh 跑官方 install.ps1 → npmmirror 镜像手动装（国内最快，sha1 校验，布局与官方一致）→ npm。脚本优先调 pwsh（PowerShell 7），没有才用 powershell.exe（5.1）；精简/优化过的系统 5.1 组件可能损坏（如 Get-FileHash 缺失）导致 install.ps1 失败
 - MCP 服务器授权存在 `.credentials.json`，恢复后免重新授权；若漏恢复需逐个重授
 - 旧聊天记录按原项目路径恢复，`--resume` 可继续；换过项目路径则对应会话列表不出现
 - 浏览器清理只删 claude/anthropic 域名的行，不影响其他网站登录态；但浏览器被强制关闭会丢未保存的页面状态，跑之前提醒用户保存

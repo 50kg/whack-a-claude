@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# claude-reset.sh — Claude 封号后的本机环境重置（备份/浏览器/卸载/删除/重装/还原/验证）
-# 用法: bash claude-reset.sh <backup|browser|uninstall|delete|install|restore|verify|all> [backup_dir]
+# whack-a-claude.sh — Claude 封号后的本机环境重置（备份/浏览器/卸载/删除/重装/还原/验证）
+# 用法: bash whack-a-claude.sh <backup|browser|uninstall|delete|install|restore|verify|all> [backup_dir]
 set -euo pipefail
 
 BACKUP_ROOT="${BACKUP_ROOT:-$HOME/Claude_Backup}"
 H="$HOME"
 LAD="$(cygpath "$LOCALAPPDATA")"
+# 优先 pwsh（PowerShell 7）；部分系统 5.1 组件损坏（如 Get-FileHash 缺失）会导致 install.ps1 失败
+PS_EXE="$(command -v pwsh.exe 2>/dev/null || command -v pwsh 2>/dev/null || command -v powershell.exe 2>/dev/null || echo powershell.exe)"
 
 # 个人内容：备份这些，之后原样恢复
 BAK_DIRS=(skills commands hooks scripts plugins plans tasks projects file-history)
@@ -61,11 +63,15 @@ phase_backup() {
 phase_browser() {
   say "2/7 浏览器清理 (Chrome/Edge 的 claude.ai + anthropic.com 站点数据)"
   local BK="${1:-$(latest_backup)}" br UD prof db idb out found=0
-  # 浏览器必须关闭，否则 SQLite 锁死
-  if tasklist //FI "IMAGENAME eq chrome.exe" 2>/dev/null | grep -qi "chrome.exe"; then
-    confirm "Chrome 正在运行，需要强制关闭。" || { echo "已取消"; exit 1; }
+  # 浏览器必须关闭，否则 SQLite 锁死（Edge 有后台进程，也要查）
+  local browser_running=""
+  if tasklist //FI "IMAGENAME eq chrome.exe" 2>/dev/null | grep -qi "chrome.exe"; then browser_running="$browser_running Chrome"; fi
+  if tasklist //FI "IMAGENAME eq msedge.exe" 2>/dev/null | grep -qi "msedge.exe"; then browser_running="$browser_running Edge"; fi
+  if [ -n "$browser_running" ]; then
+    confirm "浏览器正在运行（$browser_running），需要强制关闭。" || { echo "已取消"; exit 1; }
     taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
-    sleep 2
+    taskkill //F //IM msedge.exe >/dev/null 2>&1 || true
+    sleep 3
   fi
   # --- 第一遍：只读扫描，列出将删除的内容 ---
   echo "扫描匹配项（只读，尚未删除）:"
@@ -81,7 +87,11 @@ phase_browser() {
         [ -f "$db" ] || continue
         out=$(python - "$db" <<'PY'
 import sqlite3, sys
-con = sqlite3.connect('file:' + sys.argv[1].replace('\\', '/') + '?mode=ro', uri=True)
+try:
+    con = sqlite3.connect('file:' + sys.argv[1].replace('\\', '/') + '?mode=ro', uri=True)
+except Exception as e:
+    print(f'  [warn ] scan skipped {sys.argv[1]}: {e}')
+    sys.exit(0)
 try:
     for r in con.execute("SELECT DISTINCT host_key FROM cookies WHERE host_key LIKE '%claude%' OR host_key LIKE '%anthropic%'"):
         print('  [cookie]', r[0])
@@ -117,7 +127,11 @@ PY
         python - "$db" <<'PY'
 import sqlite3, sys
 db = sys.argv[1]
-con = sqlite3.connect(db)
+try:
+    con = sqlite3.connect(db, timeout=10)
+except Exception as e:
+    print(f'   [warn] delete skipped {db}: {e}')
+    sys.exit(0)
 n = 0
 try:
     n += con.execute("DELETE FROM cookies WHERE host_key LIKE '%claude%' OR host_key LIKE '%anthropic%'").rowcount
@@ -127,7 +141,11 @@ try:
     n += con.execute("DELETE FROM logins WHERE origin_url LIKE '%claude%' OR origin_url LIKE '%anthropic%' OR signon_realm LIKE '%claude%' OR signon_realm LIKE '%anthropic%'").rowcount
 except sqlite3.OperationalError:
     pass
-con.commit(); con.close()
+try:
+    con.commit()
+except Exception as e:
+    print(f'   [warn] commit failed {db}: {e}')
+con.close()
 print(f"   {db}: {n} rows deleted")
 PY
       done
@@ -142,7 +160,7 @@ EOF
 phase_uninstall() {
   say "3/7 卸载桌面版 (MSIX)"
   taskkill //F //IM Claude.exe 2>/dev/null || true
-  powershell.exe -NoProfile -Command \
+  "$PS_EXE" -NoProfile -Command \
     "if (Get-AppxPackage -Name 'Claude') { Get-AppxPackage -Name 'Claude' | Remove-AppxPackage; 'removed' } else { 'not installed' }"
 }
 
@@ -159,12 +177,55 @@ phase_delete() {
   done
 }
 
+# npmmirror 镜像手动安装（国内最快通道）：元数据→sha1校验→解压→官方布局
+install_from_npmmirror() {
+  local META VER SHA TGZ TMPD
+  echo "npmmirror: 查询最新版..."
+  META="$(curl -s --max-time 15 "https://registry.npmmirror.com/@anthropic-ai/claude-code-win32-x64/latest")" || return 1
+  VER="$(printf '%s' "$META" | python -c "import json,sys; print(json.load(sys.stdin)['version'])" 2>/dev/null)"
+  SHA="$(printf '%s' "$META" | python -c "import json,sys; print(json.load(sys.stdin)['dist']['shasum'])" 2>/dev/null)"
+  [ -n "$VER" ] || { echo "!! 元数据解析失败"; return 1; }
+  echo "npmmirror: $VER"
+  TGZ="claude-code-win32-x64-$VER.tgz"
+  TMPD="${TMPDIR:-/tmp}/whack-a-claude-dl"
+  mkdir -p "$TMPD"
+  curl -L --retry 3 --connect-timeout 10 -C - \
+    -o "$TMPD/$TGZ" "https://registry.npmmirror.com/@anthropic-ai/claude-code-win32-x64/-/$TGZ" || return 1
+  if [ -n "$SHA" ]; then
+    (cd "$TMPD" && echo "$SHA  $TGZ" | sha1sum -c -) || { echo "!! sha1 校验失败"; return 1; }
+  fi
+  python - "$TMPD/$TGZ" "$H" "$VER" <<'PY'
+import sys, tarfile, shutil, os
+tgz, home, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+xdir = os.path.join(os.path.dirname(tgz), 'x')
+with tarfile.open(tgz) as t:
+    t.extractall(xdir)
+src = os.path.join(xdir, 'package', 'claude.exe')
+vdir = os.path.join(home, '.local', 'share', 'claude', 'versions', ver)
+os.makedirs(vdir, exist_ok=True)
+os.makedirs(os.path.join(home, '.local', 'bin'), exist_ok=True)
+dst = os.path.join(vdir, 'claude.exe')
+shutil.copy2(src, dst)
+binp = os.path.join(home, '.local', 'bin', 'claude.exe')
+try:
+    if os.path.exists(binp):
+        os.remove(binp)
+    os.link(dst, binp)
+except OSError:
+    shutil.copy2(dst, binp)
+print(f'npmmirror: claude {ver} installed -> ~/.local/bin/claude.exe')
+PY
+}
+
 phase_install() {
   say "5/7 安装最新 Claude Code CLI"
-  if powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "irm https://claude.ai/install.ps1 | iex"; then
-    echo "install.ps1 OK"
+  if [ -n "$PS_EXE" ] && "$PS_EXE" -NoProfile -ExecutionPolicy Bypass -Command "irm https://claude.ai/install.ps1 | iex" \
+     && [ -f "$H/.local/bin/claude.exe" ]; then
+    echo "install.ps1 OK ($PS_EXE)"
+  elif install_from_npmmirror; then
+    :
   else
-    echo "!! install.ps1 失败（网络？），走 npm 兜底"
+    echo "!! npmmirror 也失败，最后走 npm"
     npm i -g @anthropic-ai/claude-code
   fi
   [ -f "$H/.local/bin/claude.exe" ] && echo "claude.exe 就位" || echo "!! 未找到 ~/.local/bin/claude.exe（可能走了 npm，路径不同）"

@@ -14,7 +14,7 @@ Claude 账号被封后的**本机环境一键重置 + 个人数据保全**工具
 | `browser` | 清理 Chrome/Edge 中 claude.ai / anthropic.com 的 Cookies、保存的登录、IndexedDB。**两遍式**：先只读扫描逐条列出命中项，确认后才删；原文件自动备份可回滚 |
 | `uninstall` | 卸载 Claude 桌面版（MSIX 商店应用） |
 | `delete` | 删除 CLI + 桌面版全部账号痕迹（9 个 Claude 专属路径，强制要求备份存在 + 输入 YES） |
-| `install` | 安装最新 Claude Code CLI（官方 install.ps1，失败自动走 npm 兜底） |
+| `install` | 安装最新 Claude Code CLI（pwsh 跑 install.ps1 → npmmirror 镜像 → npm 三级兜底） |
 | `restore` | 还原备份，生成剔除 `oauthAccount` / `userID` 的净化版 `.claude.json` |
 | `verify` | 验证 CLI 可用、无账号残留，并打印重新注册的完整注意事项 |
 | `all` | 以上全串行（关键节点仍需人工确认） |
@@ -36,9 +36,9 @@ Claude 账号被封后的**本机环境一键重置 + 个人数据保全**工具
 ```bash
 git clone https://github.com/wangteakwoo-wq/whack-a-claude.git
 cd whack-a-claude
-bash scripts/claude-reset.sh backup     # 先备份，永远从这一步开始
-bash scripts/claude-reset.sh all        # 或一把梭（delete 前会要求确认）
-bash scripts/claude-reset.sh verify     # 验证 + 打印重新注册注意事项
+bash scripts/whack-a-claude.sh backup     # 先备份，永远从这一步开始
+bash scripts/whack-a-claude.sh all        # 或一把梭（delete 前会要求确认）
+bash scripts/whack-a-claude.sh verify     # 验证 + 打印重新注册注意事项
 ```
 
 作为 skill 加载（推荐，AI 助手会按 SKILL.md 里的安全守则逐步执行并解释）：
@@ -54,7 +54,7 @@ cp -r whack-a-claude ~/.claude/skills/
 
 ## 配置
 
-- 备份位置默认 `~/Claude_Backup`，用环境变量改：`BACKUP_ROOT=/e/backup bash scripts/claude-reset.sh backup`
+- 备份位置默认 `~/Claude_Backup`，用环境变量改：`BACKUP_ROOT=/e/backup bash scripts/whack-a-claude.sh backup`
 - `YES=1` 可跳过交互确认（自动化场景，慎用）
 
 ## 清理之后（脚本管不到的部分）
