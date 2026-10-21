@@ -22,7 +22,8 @@ with tempfile.TemporaryDirectory(prefix='whack-package-') as temp:
     result = subprocess.run([str(binary), '--version'], capture_output=True, text=True, encoding='utf-8', check=True, timeout=30)
     assert result.stdout.strip() == VERSION, result.stdout
     # Only open/exit the menu; never run maintenance on runner data.
-    result = subprocess.run([str(binary)], input='11\n0\n0\n', capture_output=True, text=True, encoding='utf-8', check=True, timeout=30)
+    result = subprocess.run([str(binary)], input='0\n', capture_output=True, text=True, encoding='utf-8', check=True, timeout=30)
     assert '完整备份' in result.stdout and '\ufffd' not in result.stdout, result.stdout
-    assert '更新指纹' in result.stdout and '还原指纹备份' in result.stdout, result.stdout
+    assert '清理（不自动备份）' in result.stdout and '重建会话列表' in result.stdout, result.stdout
+    assert '安装' not in result.stdout and '一把梭' not in result.stdout, result.stdout
 print('Extracted standalone package: version and Chinese menu passed.')

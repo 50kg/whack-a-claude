@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 PERSONAL = {"skills", "commands", "hooks", "scripts", "plugins", "plans", "tasks",
             "projects", "file-history", "history.jsonl", "settings.json", "settings.local.json"}
 IDENTITY = {"oauthAccount", "userID", "machineID"}
@@ -328,24 +328,10 @@ def validate_backup(env, root, fresh=False):
     return manifest
 
 
-def reset_data(env, root):
-    require_closed(env)
-    validate_backup(env, root, fresh=True)
-    for path in env.data.values():
-        print(f"  {path}")
-    confirm(f"将清理上面列出的本机数据。已验证备份: {root}")
-    # User may keep the prompt open while applications change files.
-    require_closed(env)
-    validate_backup(env, root, fresh=True)
-    for path in env.data.values():
-        remove_path(path, set(env.data.values()))
-    print("本机数据已清理。CLI 安装文件、系统钥匙串由官方安装/退出登录流程管理。")
-
-
 def object_json(path):
     data = read_json(path)
     if not isinstance(data, dict):
-        raise MaintenanceError(f"JSON 顶层必须为对象，未执行恢复: {path}")
+        raise MaintenanceError(f"JSON 顶层必须为对象，未执行操作: {path}")
     return data
 
 
@@ -431,38 +417,17 @@ def browser_plan(env):
     return plan
 
 
-def clean_browser(env, scan=False):
-    require_closed(env, browsers=True)
-    plan = browser_plan(env)
+def display_browser_plan(plan):
     for browser, path, rows in plan:
         print(f"  {browser}: {path} ({len(rows) if rows else 'IndexedDB'} 项)")
         for row in rows or []:
             print(f"    {row[0]}: {row[2]}")
-    if scan or not plan:
-        print("扫描完成，未改动浏览器数据。")
-        return
-    confirm("仅删除列出的 Claude/Anthropic 域名站点数据和保存的登录项；先创建浏览器备份。")
+
+
+def apply_browser_plan(env, plan):
     require_closed(env, browsers=True)
     if browser_plan(env) != plan:
-        raise MaintenanceError("扫描结果已变化，请重新扫描。")
-    root = new_archive(env, "browser")
-    entries = []
-    # Back up ALL databases using SQLite's backup API (including WAL content),
-    # and ALL IndexedDB folders before deleting the first row/file.
-    for index, (_, path, rows) in enumerate(plan):
-        dest = root / str(index)
-        if rows is None:
-            copy_path(path, dest)
-        else:
-            with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as src:
-                with contextlib.closing(sqlite3.connect(dest)) as dst:
-                    src.backup(dst)
-        entries.append({"source": str(path), "payload": str(index), "files": inventory(dest)})
-    write_json(root / "browser-manifest.json", {"entries": entries})
-    print(f"浏览器备份: {root}")
-    require_closed(env, browsers=True)
-    if browser_plan(env) != plan:
-        raise MaintenanceError("备份期间浏览器数据变化，请重试。")
+        raise MaintenanceError("浏览器扫描结果已变化，请重新清理。")
     for _, path, rows in plan:
         if rows is None:
             remove_path(path, {p for _, p, r in plan if r is None})
@@ -470,56 +435,51 @@ def clean_browser(env, scan=False):
             with contextlib.closing(sqlite3.connect(path, timeout=2)) as conn:
                 with conn:
                     for table in {r[0] for r in rows}:
-                        # Table names are fixed constants, row IDs remain bound parameters.
                         conn.executemany(f"DELETE FROM {table} WHERE rowid=?", [(r[1],) for r in rows if r[0] == table])
-    print("浏览器清理完成。Local Storage、Safari 请在浏览器设置中手动按站点管理。")
 
 
-def install_cli(env):
-    confirm("将从 claude.ai 下载并运行官方安装程序，需要网络连接。")
-    import urllib.request
-    windows = env.system == "Windows"
-    url = "https://claude.ai/install.ps1" if windows else "https://claude.ai/install.sh"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        if urlparse(response.url).scheme != "https":
-            raise MaintenanceError("安装程序下载发生了非 HTTPS 跳转。")
-        content = response.read(5 * 1024 * 1024 + 1)
-    if not content or len(content) > 5 * 1024 * 1024:
-        raise MaintenanceError("安装程序大小异常。")
-    with tempfile.TemporaryDirectory(prefix="whack-install-") as temp:
-        script = Path(temp) / ("install.ps1" if windows else "install.sh")
-        script.write_bytes(content)
-        command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)] if windows else ["/bin/bash", str(script)]
-        subprocess.run(command, check=True)
-    verify_cli(env, required=True)
-
-
-def verify_cli(env, required=False):
-    native = env.home / ".local/bin" / ("claude.exe" if env.system == "Windows" else "claude")
-    binary = str(native) if native.exists() else shutil.which("claude")
-    if binary:
-        subprocess.run([binary, "--version"], check=True, timeout=30)
-        return True
-    if required:
-        raise MaintenanceError("安装程序结束，但未找到可运行的 Claude CLI；请检查官方安装输出。")
-    print("未找到 Claude CLI。")
-    return False
-
-
-def uninstall(env, root):
+def clean(env, scan=False, keep_history=False):
+    if env.system == "Windows" and "systemprofile" in str(env.home).lower():
+        raise MaintenanceError("请使用自己的 Windows 用户账号运行，不能以 SYSTEM 身份清理。")
     require_closed(env)
-    confirm("将卸载当前用户的 Claude 桌面程序；请先完成完整备份。")
+    require_closed(env, browsers=True)
+    changes = identity_plan(env, keep_history)
+    browsers = browser_plan(env)
+    print("\n----------------------------------------\n清理范围（不自动备份）\n----------------------------------------")
+    for change in changes:
+        label = '删除' if change['content'] is None else '更新本地标识'
+        print(f"  {label}: {change['path']}")
+    display_browser_plan(browsers)
+    if not changes and not browsers:
+        print("没有找到需要清理的项目。")
+        return
+    if scan:
+        print("扫描完成，未修改文件，也未创建备份。")
+        return
+    confirm("将直接清理列出的项目，不自动备份；保留个人配置、MCP、skills 和聊天。浏览器相关站点会退出登录。")
     require_closed(env)
-    validate_backup(env, root, fresh=True)
-    if env.system == "Windows":
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                        "$ErrorActionPreference='Stop'; Get-AppxPackage -Name 'Claude' | Remove-AppxPackage -ErrorAction Stop"], check=True)
-    else:
-        app = Path("/Applications/Claude.app")
-        # Standard app bundles contain framework symlinks. rmtree unlinks them
-        # without following their targets; the bundle root itself cannot be a link.
-        remove_path(app, {app}, allow_nested_links=True)
-    print("桌面版卸载步骤完成；非标准安装请使用系统的应用管理。")
+    require_closed(env, browsers=True)
+    for change in changes:
+        if inventory(change['path']) != change['before']:
+            raise MaintenanceError("确认期间本机数据已变化，未开始清理，请重试。")
+    if browser_plan(env) != browsers:
+        raise MaintenanceError("确认期间浏览器数据已变化，未开始清理，请重试。")
+    try:
+        for change in changes:
+            target, content = change['path'], change['content']
+            if content is None:
+                remove_path(target, {c['path'] for c in changes if c['content'] is None})
+            else:
+                atomic_bytes(target, content)
+        for change in changes:
+            expected = None if change['content'] is None else {'.': hashlib.sha256(change['content']).hexdigest()}
+            if inventory(change['path']) != expected:
+                raise MaintenanceError(f"清理后校验失败: {change['path']}")
+        apply_browser_plan(env, browsers)
+    except BaseException:
+        print("清理未完成，部分项目可能已经修改；本次没有自动备份。")
+        raise
+    print("清理完成，未创建备份。Local Storage、Safari 请在浏览器设置中按站点管理。")
 
 
 def rebuild_sessions(env, root, account=None):
@@ -763,43 +723,6 @@ def apply_identity_snapshot(env, root):
             raise MaintenanceError(f"还原后校验失败: {path}")
 
 
-def rotate_identity(env, scan=False, keep_history=False):
-    if env.system == "Windows" and "systemprofile" in str(env.home).lower():
-        raise MaintenanceError("请使用自己的 Windows 用户账号运行，不能以 SYSTEM 身份维护。")
-    if not scan:
-        require_closed(env)
-    changes = identity_plan(env, keep_history)
-    for change in changes:
-        print(f"  {'备份后清理' if change['content'] is None else '更新'}: {change['path']}")
-    if scan or not changes:
-        print("扫描完成，未修改文件。" if changes else "没有找到可维护的本地标识。")
-        return
-    confirm("将更新本地设备标识，并备份后清理列出的缓存/历史副本；MCP、skills、登录凭据和聊天不变。")
-    require_closed(env)
-    root = identity_snapshot(env, changes)
-    print(f"指纹原件备份: {root}")
-    validate_identity(env, root)
-    for change in changes:
-        if inventory(change["path"]) != change["before"]:
-            raise MaintenanceError("备份后数据变化，未开始修改，请重新扫描。")
-    try:
-        for change in changes:
-            path, content = change["path"], change["content"]
-            if content is None:
-                remove_path(path, {c["path"] for c in changes if c["content"] is None})
-            else:
-                atomic_bytes(path, content)
-        for change in changes:
-            expected = None if change["content"] is None else {".": hashlib.sha256(change["content"]).hexdigest()}
-            if inventory(change["path"]) != expected:
-                raise MaintenanceError(f"指纹更新后校验失败: {change['path']}")
-    except BaseException:
-        print(f"修改未完成，正在从 {root} 回退。")
-        apply_identity_snapshot(env, root)
-        raise
-    print("指纹维护完成，可在指纹子菜单中原样还原；不影响服务端账号状态。")
-
-
 def restore_identity(env, requested=None):
     require_closed(env)
     if requested and requested != "latest":
@@ -830,97 +753,80 @@ def restore_identity(env, requested=None):
     print("指纹备份已原样还原。")
 
 
-def identity_menu(env):
-    while True:
-        print("\n设备指纹维护（根据朋友提供的脚本整合）\n  1) 只扫描\n  2) 更新指纹（自动备份）\n  3) 还原指纹备份\n  4) 更新指纹但保留历史快照\n  0) 返回主菜单")
-        choice = input("请选择: ").strip()
-        if choice == "0":
-            return
-        try:
-            if choice in {"1", "2", "4"}:
-                rotate_identity(env, scan=choice == "1", keep_history=choice == "4")
-            elif choice == "3":
-                restore_identity(env)
-            else:
-                print("无效选择。")
-        except (MaintenanceError, OSError, ValueError) as exc:
-            print(f"指纹维护未完成: {exc}")
-
-
 def verify(env):
     print(f"whack-a-claude {VERSION} | {env.system} {platform.machine()}")
     print(f"用户目录: {env.home}\n备份目录: {env.backup_root}")
-    verify_cli(env)
-    count = len(list((env.home / ".claude/projects").glob("*/*.jsonl")))
+    count = len(list((env.home / '.claude/projects').glob('*/*.jsonl')))
     print(f"聊天记录文件: {count}（数量不代表内容完整性）")
+    checks = [env.home / '.claude.json', env.home / '.claude/settings.json']
     for desktop in env.desktops:
         if desktop.exists():
-            print(f"桌面数据: {desktop}")
-    print("本工具仅维护本机数据；账号问题请使用官方支持与申诉渠道。")
+            indexes = len(list((desktop / 'claude-code-sessions').glob('*/*/local_*.json')))
+            print(f"桌面数据: {desktop} | 会话索引文件: {indexes}")
+            checks.append(desktop / 'claude_desktop_config.json')
+    for item in checks:
+        if item.is_file():
+            object_json(item)
+            print(f"配置格式正常: {item}")
+    print("验证完成。")
 
 
-MENU = """
-  whack-a-claude — 本机数据维护
-  1 / 2  完整备份（含所有聊天和桌面数据）
-  3      扫描并清理浏览器站点数据
-  4      卸载桌面版
-  5      清理本机数据（必须有最新完整备份）
-  6      官方安装 Claude Code CLI
-  7      恢复个人配置与聊天
-  8      重建桌面会话列表（实验功能）
-  9      检查环境
-  10     备份 → 清理本机数据 → 安装 CLI → 恢复
-  11     设备指纹（扫描 / 更新 / 还原备份）
-  12     仅扫描浏览器（不修改）
-  0      退出
+MENU = f"""
+========================================
+  whack-a-claude  v{VERSION}
+----------------------------------------
+
+  1. 完整备份
+  2. 清理（不自动备份）
+  3. 还原备份
+  4. 重建会话列表（实验功能）
+  5. 验证
+
+  0. 退出
+========================================
 """
-ALIASES = {"1": "backup", "2": "backup", "3": "browser", "4": "uninstall", "5": "delete",
-           "6": "install", "7": "restore", "8": "sessions", "9": "verify", "10": "all",
-           "11": "fingerprint", "12": "browser-scan", "0": "exit"}
+ALIASES = {'1': 'backup', '2': 'clean', '3': 'restore', '4': 'sessions', '5': 'verify', '0': 'exit'}
+
+
+def choose_restore_source(env, requested=None):
+    if requested and requested != 'latest':
+        return Path(requested).expanduser().absolute()
+    roots = [r for r in env.backup_root.iterdir() if r.is_dir() and
+             ((r / 'manifest.json').is_file() or (r / 'identity-manifest.json').is_file())] if env.backup_root.exists() else []
+    roots.sort(key=lambda r: r.stat().st_mtime_ns, reverse=True)
+    if not roots:
+        raise MaintenanceError('没有可还原的备份。')
+    if requested == 'latest':
+        return roots[0]
+    for index, item in enumerate(roots, 1):
+        kind = '指纹备份' if (item / 'identity-manifest.json').is_file() else '完整备份'
+        print(f'  {index}) {item.name} [{kind}]')
+    choice = input('选择要还原的备份编号（回车取消）: ').strip()
+    if not choice.isdigit() or not 1 <= int(choice) <= len(roots):
+        raise MaintenanceError('已取消。')
+    return roots[int(choice) - 1]
 
 
 def dispatch(env, command, requested=None, account=None, scan=False, keep_history=False):
     command = ALIASES.get(command, command)
-    if command == "backup":
+    if scan and command != 'clean':
+        raise MaintenanceError('--scan 仅适用于清理。')
+    if command == 'backup':
         backup(env)
-    elif command in {"browser", "browser-scan"}:
-        clean_browser(env, scan or command == "browser-scan")
-    elif command == "uninstall":
-        # Require complete fresh data before app uninstallation (MSIX may remove it).
-        root = choose_backup(env, requested)
-        validate_backup(env, root, fresh=True)
-        uninstall(env, root)
-    elif command == "delete":
-        reset_data(env, choose_backup(env, requested))
-    elif command == "install":
-        install_cli(env)
-    elif command == "restore":
-        restore(env, choose_backup(env, requested))
-    elif command == "sessions":
+    elif command == 'clean':
+        clean(env, scan, keep_history)
+    elif command == 'restore':
+        source = choose_restore_source(env, requested)
+        if (source / 'identity-manifest.json').is_file():
+            restore_identity(env, source)
+        else:
+            restore(env, source)
+    elif command == 'sessions':
         rebuild_sessions(env, choose_backup(env, requested), account)
-    elif command == "identity":
-        rotate_identity(env, scan, keep_history)
-    elif command == "identity-restore":
-        restore_identity(env, requested)
-    elif command == "fingerprint":
-        identity_menu(env)
-    elif command == "verify":
-        verify(env)
-    elif command == "all":
-        root = backup(env)
-        payload = root / "payload"
-        for path in (payload / "config", payload / "claude/.credentials.json"):
-            if path.exists():
-                object_json(path)
-        reset_data(env, root)
-        try:
-            install_cli(env)
-        finally:
-            # Installation cancellation/failure must not leave personal data deleted.
-            restore(env, root, ask=False)
+    elif command == 'verify':
         verify(env)
     else:
-        raise MaintenanceError(f"未知操作: {command}")
+        raise MaintenanceError(f'未知操作: {command}。可用命令: backup / clean / restore / sessions / verify')
 
 
 def main(argv=None):
@@ -928,11 +834,11 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Claude 本机备份、恢复与维护工具")
-    parser.add_argument("command", nargs="?", help="backup/browser/delete/install/restore/sessions/verify/all/identity/identity-restore 或菜单编号")
+    parser.add_argument("command", nargs="?", help="backup/clean/restore/sessions/verify 或菜单编号")
     parser.add_argument("backup", nargs="?", help="备份目录或 latest；backup all 为兼容写法")
     parser.add_argument("--account", help="重建列表时使用的本机账号/组织目录")
-    parser.add_argument("--scan", action="store_true", help="仅扫描 browser/identity")
-    parser.add_argument("--keep-history", action="store_true", help="更新指纹时保留历史快照")
+    parser.add_argument("--scan", action="store_true", help="仅扫描清理范围，不修改文件")
+    parser.add_argument("--keep-history", action="store_true", help="清理时保留历史快照")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     try:
