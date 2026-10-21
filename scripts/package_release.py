@@ -3,8 +3,10 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import sys
 import zipfile
 
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 root = Path(__file__).resolve().parent.parent
 asset = os.environ['ASSET']
 folder = root / 'build' / ('whack-a-claude-' + asset)

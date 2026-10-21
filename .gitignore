@@ -24,3 +24,4 @@ before-restore-*/
 browser-*/
 sessions-*/
 claude-fp-backup-*/
+/whack-a-claude.exe

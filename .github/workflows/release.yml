@@ -32,6 +32,8 @@ jobs:
         env:
           ASSET: ${{ matrix.asset }}
         run: python scripts/package_release.py
+      - name: Test extracted distribution
+        run: python scripts/smoke_release.py
       - uses: actions/upload-artifact@v4
         with:
           name: whack-a-claude-${{ matrix.asset }}
