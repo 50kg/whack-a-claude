@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 PERSONAL = {"skills", "commands", "hooks", "scripts", "plugins", "plans", "tasks",
             "projects", "file-history", "history.jsonl", "settings.json", "settings.local.json"}
 IDENTITY = {"oauthAccount", "userID", "machineID"}
@@ -625,47 +625,226 @@ def rebuild_sessions(env, root, account=None):
     print(f"新增 {len(created)} 条，原索引快照: {snap}")
 
 
-def rotate_identity(env, scan=False):
-    require_closed(env)
-    config = env.home / ".claude.json"
+def identity_cache(env):
+    return env.local / "claude-cli-nodejs" if env.system == "Windows" else env.home / "Library/Caches/claude-cli-nodejs"
+
+
+def identity_allowed(env, path):
+    """Accept only the friend's original scope, expanded to known desktop locations."""
+    path = Path(path)
+    if not inside(path, env.home) or path.resolve() != path.absolute():
+        return False
+    fixed = {env.home / ".claude.json"}
+    for desktop in env.desktops:
+        fixed.update({desktop / "ant-did", desktop / "sentry/scope_v3.json"})
+    if path in fixed:
+        return True
+    if path.parent == env.home / ".claude/backups":
+        return path.name.startswith(".claude.json.backup.")
+    return path.parent == identity_cache(env) and bool(re.search(r"[0-9a-f]{8}-[0-9a-f]{4}", path.name, re.I))
+
+
+def identity_plan(env, keep_history=False):
     changes = []
+
+    def add(path, content):
+        if not identity_allowed(env, path):
+            raise MaintenanceError(f"指纹路径不在允许范围内: {path}")
+        changes.append({"path": path, "content": content, "before": inventory(path)})
+
+    config = env.home / ".claude.json"
     if config.exists():
         data = object_json(config)
-        for key in IDENTITY - {"oauthAccount"}:
-            if key in data:
-                data[key] = os.urandom(32).hex()
-        changes.append((config, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")))
+        for key in ("userID", "machineID"):
+            data[key] = os.urandom(32).hex()
+        add(config, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
     for desktop in env.desktops:
-        path = desktop / "ant-did"
-        if path.exists():
-            old = path.read_text(encoding="utf-8-sig").strip()
+        device = desktop / "ant-did"
+        old = new = None
+        if device.exists():
+            old = device.read_text(encoding="utf-8-sig").strip()
+            new = str(uuid.uuid4())
             try:
                 uuid.UUID(old)
-                content = str(uuid.uuid4()).encode("ascii")
+                content = new.encode("ascii")
             except ValueError:
                 try:
-                    uuid.UUID(base64.b64decode(old, validate=True).decode("ascii"))
+                    old = base64.b64decode(old, validate=True).decode("ascii")
+                    uuid.UUID(old)
                 except (ValueError, UnicodeError) as exc:
-                    raise MaintenanceError(f"设备标识格式未知，拒绝改写: {path}") from exc
-                content = base64.b64encode(str(uuid.uuid4()).encode("ascii"))
-            changes.append((path, content))
-    for path, _ in changes:
-        print(f"  {path}")
+                    raise MaintenanceError(f"设备标识格式未知，拒绝改写: {device}") from exc
+                content = base64.b64encode(new.encode("ascii"))
+            add(device, content)
+        sentry = desktop / "sentry/scope_v3.json"
+        if sentry.exists():
+            object_json(sentry)  # refuse malformed JSON before writing anything
+            text = sentry.read_text(encoding="utf-8-sig")
+            original = text
+            if old:
+                text = text.replace(old, new)
+            match = re.search(r"\b[0-9a-fA-F]{32}\b", text)
+            if match:
+                text = text.replace(match[0], os.urandom(16).hex())
+            if text != original:
+                add(sentry, text.encode("utf-8"))
+    cache = identity_cache(env)
+    if cache.is_dir():
+        for item in sorted(cache.iterdir()):
+            if item.is_dir() and identity_allowed(env, item):
+                add(item, None)
+    if not keep_history:
+        for item in sorted((env.home / ".claude/backups").glob(".claude.json.backup.*")):
+            if item.is_file():
+                add(item, None)
+    return changes
+
+
+def identity_snapshot(env, changes, prefix="identity"):
+    root = new_archive(env, prefix)
+    entries = []
+    for index, change in enumerate(changes):
+        path = change["path"]
+        if not identity_allowed(env, path):
+            raise MaintenanceError(f"指纹路径越界: {path}")
+        before = inventory(path)
+        if "before" in change and before != change["before"]:
+            raise MaintenanceError("扫描后数据已变化，请重新扫描。")
+        if before is not None:
+            copy_path(path, root / "payload" / str(index))
+            if inventory(root / "payload" / str(index)) != before or inventory(path) != before:
+                raise MaintenanceError("指纹备份期间数据变化，未开始修改。")
+        entries.append({"relative": path.relative_to(env.home).as_posix(), "files": before})
+    write_json(root / "identity-manifest.json", {"format": 1, "kind": "identity", "system": env.system,
+               "home": str(env.home), "entries": entries})
+    return root
+
+
+def validate_identity(env, root):
+    root = Path(root)
+    inventory(root)
+    data = object_json(root / "identity-manifest.json")
+    if data.get("format") != 1 or data.get("kind") != "identity" or data.get("system") != env.system or data.get("home") != str(env.home):
+        raise MaintenanceError("该指纹备份无效或来自其他用户/系统。")
+    entries = data.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise MaintenanceError("指纹备份为空或不完整。")
+    seen = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("relative"), str):
+            raise MaintenanceError("指纹备份清单结构异常。")
+        relative = Path(entry["relative"])
+        path = env.home / relative
+        if relative.is_absolute() or ".." in relative.parts or not identity_allowed(env, path) or path in seen:
+            raise MaintenanceError("指纹备份包含重复或越界路径。")
+        seen.add(path)
+        if "files" not in entry or (entry["files"] is not None and not isinstance(entry["files"], dict)):
+            raise MaintenanceError("指纹备份校验字段异常。")
+        if inventory(root / "payload" / str(index)) != entry["files"]:
+            raise MaintenanceError(f"指纹备份损坏: {relative}")
+    return entries
+
+
+def apply_identity_snapshot(env, root):
+    entries = validate_identity(env, root)
+    for index, entry in enumerate(entries):
+        path = env.home / entry["relative"]
+        if entry["files"] is None:
+            remove_path(path, {path})
+        else:
+            source = Path(root) / "payload" / str(index)
+            if source.is_file():
+                atomic_bytes(path, fs_path(source).read_bytes())
+            else:
+                # Removed cache directories may have been recreated. Replace only
+                # this exact, allowed cache child, never the entire cache root.
+                remove_path(path, {path})
+                copy_path(source, path)
+        if inventory(path) != entry["files"]:
+            raise MaintenanceError(f"还原后校验失败: {path}")
+
+
+def rotate_identity(env, scan=False, keep_history=False):
+    if env.system == "Windows" and "systemprofile" in str(env.home).lower():
+        raise MaintenanceError("请使用自己的 Windows 用户账号运行，不能以 SYSTEM 身份维护。")
+    if not scan:
+        require_closed(env)
+    changes = identity_plan(env, keep_history)
+    for change in changes:
+        print(f"  {'备份后清理' if change['content'] is None else '更新'}: {change['path']}")
     if scan or not changes:
-        print("扫描完成，未修改文件。")
+        print("扫描完成，未修改文件。" if changes else "没有找到可维护的本地标识。")
         return
-    confirm("仅更新上述本地设备标识；不会改变服务端账号状态。修改前完整备份。")
-    root = backup(env)
-    validate_backup(env, root, fresh=True)
-    originals = {path: path.read_bytes() for path, _ in changes}
+    confirm("将更新本地设备标识，并备份后清理列出的缓存/历史副本；MCP、skills、登录凭据和聊天不变。")
+    require_closed(env)
+    root = identity_snapshot(env, changes)
+    print(f"指纹原件备份: {root}")
+    validate_identity(env, root)
+    for change in changes:
+        if inventory(change["path"]) != change["before"]:
+            raise MaintenanceError("备份后数据变化，未开始修改，请重新扫描。")
     try:
-        for path, content in changes:
-            atomic_bytes(path, content)
-    except Exception:
-        for path, content in originals.items():
-            atomic_bytes(path, content)
+        for change in changes:
+            path, content = change["path"], change["content"]
+            if content is None:
+                remove_path(path, {c["path"] for c in changes if c["content"] is None})
+            else:
+                atomic_bytes(path, content)
+        for change in changes:
+            expected = None if change["content"] is None else {".": hashlib.sha256(change["content"]).hexdigest()}
+            if inventory(change["path"]) != expected:
+                raise MaintenanceError(f"指纹更新后校验失败: {change['path']}")
+    except BaseException:
+        print(f"修改未完成，正在从 {root} 回退。")
+        apply_identity_snapshot(env, root)
         raise
-    print(f"本地标识已更新，完整原件保存在: {root}")
+    print("指纹维护完成，可在指纹子菜单中原样还原；不影响服务端账号状态。")
+
+
+def restore_identity(env, requested=None):
+    require_closed(env)
+    if requested and requested != "latest":
+        root = Path(requested).expanduser().absolute()
+    else:
+        roots = sorted((r for r in env.backup_root.glob("identity-*") if (r / "identity-manifest.json").is_file()), reverse=True)
+        if not roots:
+            raise MaintenanceError("没有本工具生成的指纹备份。")
+        if requested == "latest":
+            root = roots[0]
+        else:
+            for index, item in enumerate(roots, 1):
+                print(f"  {index}) {item.name}")
+            choice = input("选择指纹备份编号（回车取消）: ").strip()
+            if not choice.isdigit() or not 1 <= int(choice) <= len(roots):
+                raise MaintenanceError("已取消。")
+            root = roots[int(choice) - 1]
+    entries = validate_identity(env, root)
+    confirm(f"原样恢复该次指纹维护涉及的文件（包括当时的 .claude.json）；先保存当前版本: {root}")
+    require_closed(env)
+    snapshot = identity_snapshot(env, [{"path": env.home / e["relative"]} for e in entries], "before-identity-restore")
+    print(f"还原前快照: {snapshot}")
+    try:
+        apply_identity_snapshot(env, root)
+    except BaseException:
+        apply_identity_snapshot(env, snapshot)
+        raise
+    print("指纹备份已原样还原。")
+
+
+def identity_menu(env):
+    while True:
+        print("\n设备指纹维护（根据朋友提供的脚本整合）\n  1) 只扫描\n  2) 更新指纹（自动备份）\n  3) 还原指纹备份\n  4) 更新指纹但保留历史快照\n  0) 返回主菜单")
+        choice = input("请选择: ").strip()
+        if choice == "0":
+            return
+        try:
+            if choice in {"1", "2", "4"}:
+                rotate_identity(env, scan=choice == "1", keep_history=choice == "4")
+            elif choice == "3":
+                restore_identity(env)
+            else:
+                print("无效选择。")
+        except (MaintenanceError, OSError, ValueError) as exc:
+            print(f"指纹维护未完成: {exc}")
 
 
 def verify(env):
@@ -691,16 +870,16 @@ MENU = """
   8      重建桌面会话列表（实验功能）
   9      检查环境
   10     备份 → 清理本机数据 → 安装 CLI → 恢复
-  11     本地设备标识维护
+  11     设备指纹（扫描 / 更新 / 还原备份）
   12     仅扫描浏览器（不修改）
   0      退出
 """
 ALIASES = {"1": "backup", "2": "backup", "3": "browser", "4": "uninstall", "5": "delete",
            "6": "install", "7": "restore", "8": "sessions", "9": "verify", "10": "all",
-           "11": "identity", "12": "browser-scan", "0": "exit"}
+           "11": "fingerprint", "12": "browser-scan", "0": "exit"}
 
 
-def dispatch(env, command, requested=None, account=None, scan=False):
+def dispatch(env, command, requested=None, account=None, scan=False, keep_history=False):
     command = ALIASES.get(command, command)
     if command == "backup":
         backup(env)
@@ -720,7 +899,11 @@ def dispatch(env, command, requested=None, account=None, scan=False):
     elif command == "sessions":
         rebuild_sessions(env, choose_backup(env, requested), account)
     elif command == "identity":
-        rotate_identity(env, scan)
+        rotate_identity(env, scan, keep_history)
+    elif command == "identity-restore":
+        restore_identity(env, requested)
+    elif command == "fingerprint":
+        identity_menu(env)
     elif command == "verify":
         verify(env)
     elif command == "all":
@@ -745,10 +928,11 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Claude 本机备份、恢复与维护工具")
-    parser.add_argument("command", nargs="?", help="backup/browser/delete/install/restore/sessions/verify/all/identity 或菜单编号")
+    parser.add_argument("command", nargs="?", help="backup/browser/delete/install/restore/sessions/verify/all/identity/identity-restore 或菜单编号")
     parser.add_argument("backup", nargs="?", help="备份目录或 latest；backup all 为兼容写法")
     parser.add_argument("--account", help="重建列表时使用的本机账号/组织目录")
     parser.add_argument("--scan", action="store_true", help="仅扫描 browser/identity")
+    parser.add_argument("--keep-history", action="store_true", help="更新指纹时保留历史快照")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     try:
@@ -756,7 +940,7 @@ def main(argv=None):
         with exclusive(env):
             if args.command:
                 if ALIASES.get(args.command) != "exit":
-                    dispatch(env, args.command, args.backup, args.account, args.scan)
+                    dispatch(env, args.command, args.backup, args.account, args.scan, args.keep_history)
             else:
                 while True:
                     print(MENU)

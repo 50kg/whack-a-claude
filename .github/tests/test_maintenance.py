@@ -323,8 +323,103 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(config['mcpServers'], {'demo': {'command': 'x'}})
         self.assertEqual(config['oauthAccount'], {'token': 'old'})
         self.assertNotEqual(app.base64.b64decode((self.env.desktops[0] / 'ant-did').read_bytes()).decode(), device)
-        root = next(self.env.backup_root.glob('backup-*'))
-        self.assertEqual(app.read_json(root / 'payload/config')['userID'], 'old')
+        root = next(self.env.backup_root.glob('identity-*'))
+        self.assertEqual(app.read_json(root / 'payload/0')['userID'], 'old')
+
+    def fingerprint_sample(self):
+        self.sample()
+        device = str(__import__('uuid').uuid4())
+        self.put('AppData/Roaming/Claude/ant-did', app.base64.b64encode(device.encode()).decode())
+        app.write_json(self.env.desktops[0] / 'sentry/scope_v3.json', {'user': {'id': device}, 'installation': 'a' * 32, 'keep': 'unchanged'})
+        self.put('.claude/backups/.claude.json.backup.old', '{"userID":"old"}')
+        self.put('.claude/backups/other.json', '{"keep":true}')
+        self.put('AppData/Local/claude-cli-nodejs/cache-12345678-abcd-1234-5678-123456789abc/data', 'cache')
+        self.put('AppData/Local/claude-cli-nodejs/unrelated/data', 'keep')
+
+    def test_fingerprint_full_scope_and_exact_restore(self):
+        self.fingerprint_sample()
+        before = {key: app.inventory(path) for key, path in self.env.data.items()}
+        app.rotate_identity(self.env)
+        device = app.base64.b64decode((self.env.desktops[0] / 'ant-did').read_bytes()).decode()
+        sentry = app.read_json(self.env.desktops[0] / 'sentry/scope_v3.json')
+        self.assertEqual(sentry['user']['id'], device)
+        self.assertNotEqual(sentry['installation'], 'a' * 32)
+        self.assertEqual(sentry['keep'], 'unchanged')
+        self.assertFalse((self.home / '.claude/backups/.claude.json.backup.old').exists())
+        self.assertTrue((self.home / '.claude/backups/other.json').exists())
+        self.assertFalse((app.identity_cache(self.env) / 'cache-12345678-abcd-1234-5678-123456789abc').exists())
+        self.assertTrue((app.identity_cache(self.env) / 'unrelated/data').exists())
+        app.restore_identity(self.env, 'latest')
+        self.assertEqual(before, {key: app.inventory(path) for key, path in self.env.data.items()})
+
+    def test_fingerprint_scan_preserves_every_file(self):
+        self.fingerprint_sample()
+        before = {key: app.inventory(path) for key, path in self.env.data.items()}
+        app.rotate_identity(self.env, scan=True)
+        self.assertEqual(before, {key: app.inventory(path) for key, path in self.env.data.items()})
+        self.assertFalse(self.env.backup_root.exists())
+
+    def test_fingerprint_keep_history(self):
+        self.fingerprint_sample()
+        app.rotate_identity(self.env, keep_history=True)
+        self.assertTrue((self.home / '.claude/backups/.claude.json.backup.old').exists())
+
+    def test_fingerprint_failed_clear_rolls_back_updates_and_removed_files(self):
+        self.fingerprint_sample()
+        before = {key: app.inventory(path) for key, path in self.env.data.items()}
+        original = app.remove_path
+        failed = False
+        def fail_history(path, allowed, **kwargs):
+            nonlocal failed
+            if Path(path).name.startswith('.claude.json.backup.') and not failed:
+                failed = True
+                raise OSError('simulated history delete error')
+            return original(path, allowed, **kwargs)
+        with patch.object(app, 'remove_path', side_effect=fail_history):
+            with self.assertRaises(OSError):
+                app.rotate_identity(self.env)
+        self.assertEqual(before, {key: app.inventory(path) for key, path in self.env.data.items()})
+
+    def test_corrupt_fingerprint_backup_prevents_restore(self):
+        self.fingerprint_sample()
+        app.rotate_identity(self.env)
+        root = next(self.env.backup_root.glob('identity-*'))
+        (root / 'payload/0').write_text('{}', encoding='utf-8')
+        before = (self.home / '.claude.json').read_bytes()
+        with self.assertRaises(app.MaintenanceError):
+            app.restore_identity(self.env, str(root))
+        self.assertEqual(before, (self.home / '.claude.json').read_bytes())
+
+    def test_fingerprint_restore_rejects_unrelated_path(self):
+        self.fingerprint_sample()
+        app.rotate_identity(self.env)
+        root = next(self.env.backup_root.glob('identity-*'))
+        data = app.read_json(root / 'identity-manifest.json')
+        data['entries'][0]['relative'] = 'Documents/important.txt'
+        app.write_json(root / 'identity-manifest.json', data)
+        with self.assertRaises(app.MaintenanceError):
+            app.restore_identity(self.env, str(root))
+
+    def test_fingerprint_has_separate_submenu(self):
+        with patch('builtins.input', side_effect=['1', '0']), patch.object(app, 'rotate_identity') as rotate:
+            app.dispatch(self.env, '11')
+        rotate.assert_called_once_with(self.env, scan=True, keep_history=False)
+
+    def test_fingerprint_menu_returns_to_main_without_modification(self):
+        with patch('builtins.input', return_value='0'), patch.object(app, 'rotate_identity') as rotate:
+            app.dispatch(self.env, '11')
+        rotate.assert_not_called()
+
+    def test_macos_fingerprint_roundtrip(self):
+        env = app.Environment(home=self.home, system='Darwin', backup_root=self.home / 'Claude_Backup')
+        app.write_json(self.home / '.claude.json', {'userID': 'old', 'mcpServers': {}})
+        self.put('Library/Application Support/Claude/ant-did', str(__import__('uuid').uuid4()))
+        self.put('Library/Caches/claude-cli-nodejs/cache-12345678-abcd-1234-5678-123456789abc/data', 'cache')
+        before = {key: app.inventory(path) for key, path in env.data.items()}
+        app.rotate_identity(env)
+        self.assertNotEqual(app.read_json(self.home / '.claude.json')['userID'], 'old')
+        app.restore_identity(env, 'latest')
+        self.assertEqual(before, {key: app.inventory(path) for key, path in env.data.items()})
 
     def test_identity_scan_and_unknown_format_are_read_only(self):
         self.sample()
