@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 PERSONAL = {"skills", "commands", "hooks", "scripts", "plugins", "plans", "tasks",
             "projects", "file-history", "history.jsonl", "settings.json", "settings.local.json"}
 IDENTITY = {"oauthAccount", "userID", "machineID"}
@@ -777,9 +777,9 @@ MENU = f"""
 ----------------------------------------
 
   1. 完整备份
-  2. 清理（不自动备份）
+  2. 清除缓存 + 清除指纹 + 清除浏览器
   3. 还原备份
-  4. 重建会话列表（实验功能）
+  4. 换号重建会话列表
   5. 验证
 
   0. 退出
@@ -833,7 +833,7 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="Claude 本机备份、恢复与维护工具")
+    parser = argparse.ArgumentParser(description="Claude 缓存清理与换号会话列表重建脚本")
     parser.add_argument("command", nargs="?", help="backup/clean/restore/sessions/verify 或菜单编号")
     parser.add_argument("backup", nargs="?", help="备份目录或 latest；backup all 为兼容写法")
     parser.add_argument("--account", help="重建列表时使用的本机账号/组织目录")
