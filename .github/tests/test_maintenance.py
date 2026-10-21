@@ -91,7 +91,10 @@ class MaintenanceTests(unittest.TestCase):
     def test_verify_does_not_run_cli_or_modify_data(self):
         self.sample()
         before = {key: app.inventory(path) for key, path in self.env.data.items()}
-        with patch.object(app.subprocess, 'run', side_effect=AssertionError('Must not run CLI')):
+        # Python 3.10 may read Windows version information through subprocess.
+        # Keep that platform lookup separate from the no-CLI contract under test.
+        with patch.object(app.platform, 'machine', return_value='test-arch'), \
+             patch.object(app.subprocess, 'run', side_effect=AssertionError('Must not run CLI')):
             app.dispatch(self.env, '5')
         self.assertEqual(before, {key: app.inventory(path) for key, path in self.env.data.items()})
         self.assertIn('验证完成', self.stdout._new_target.getvalue())
