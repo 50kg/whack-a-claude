@@ -1,0 +1,44 @@
+name: Build standalone releases
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: windows-x64
+          - os: macos-15
+            asset: macos-arm64
+          - os: macos-15-intel
+            asset: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - run: python -m pip install pyinstaller==6.20.0
+      - run: python -m PyInstaller --clean --onefile --console --name whack-a-claude whack_a_claude.py
+      - name: Smoke-test executable
+        run: ./dist/whack-a-claude --version
+      - name: Package executable and documentation
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: python scripts/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whack-a-claude-${{ matrix.asset }}
+          path: release/*
+      - name: Publish assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "$GITHUB_REF_NAME" release/* --clobber

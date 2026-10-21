@@ -6,3 +6,21 @@ backup-*/
 *.log
 .DS_Store
 Thumbs.db
+
+# Runtime, packaging, credentials and local snapshots
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+release/
+*.spec
+.env
+.env.*
+!.env.example
+.whack-a-claude.lock
+before-restore-*/
+browser-*/
+sessions-*/
+claude-fp-backup-*/
