@@ -18,11 +18,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-VERSION = "2.2.1"
+VERSION = "2.2.3"
 PERSONAL = {"skills", "commands", "hooks", "scripts", "plugins", "plans", "tasks",
             "projects", "file-history", "history.jsonl", "settings.json", "settings.local.json"}
 IDENTITY = {"oauthAccount", "userID", "machineID"}
@@ -31,6 +32,87 @@ DOMAINS = {"claude.ai", "anthropic.com", "claude.com"}
 
 class MaintenanceError(Exception):
     pass
+
+
+@contextlib.contextmanager
+def console_selection():
+    """Enable mouse selection/paste in this Windows console, then restore its mode."""
+    enabled = False
+    if os.name == "nt" and sys.stdin.isatty():
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = wintypes.DWORD()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            # ENABLE_EXTENDED_FLAGS is required for ENABLE_QUICK_EDIT_MODE.
+            enabled = bool(kernel.SetConsoleMode(handle, mode.value | 0x0080 | 0x0040))
+    try:
+        yield enabled
+    finally:
+        if enabled:
+            kernel.SetConsoleMode(handle, mode.value)
+
+
+class BackupProgress:
+    """Throttled single-line progress on terminals; readable milestones in logs."""
+    def __init__(self):
+        self.stream = sys.stdout
+        self.terminal = self.stream.isatty()
+
+    @contextlib.contextmanager
+    def phase(self, label, total_files=None, total_bytes=None):
+        self.label = label
+        self.total_files, self.total_bytes = total_files, total_bytes
+        self.files = self.bytes = self.width = 0
+        self.started = time.monotonic()
+        self.last = float("-inf")
+        self.render(force=True)
+        try:
+            yield self
+        except BaseException:
+            self.render(force=True)
+            raise
+        else:
+            self.render(force=True, done=True)
+        finally:
+            if self.terminal:
+                print(file=self.stream, flush=True)
+
+    def advance(self, *, files=0, size=0):
+        self.files += files
+        self.bytes += size
+        self.render()
+
+    def render(self, *, force=False, done=False):
+        now = time.monotonic()
+        if not force and now - self.last < (0.15 if self.terminal else 5):
+            return
+        self.last = now
+        if self.total_files is None:
+            bar = "[  扫描中  ]" if not done else "[ 扫描完成 ]"
+            count = f"{self.files} 个文件"
+        else:
+            total = self.total_bytes or self.total_files
+            current = self.bytes if self.total_bytes else self.files
+            ratio = min(current / total, 1) if total else 0
+            # Only a successfully finished phase may report 100%.
+            percent = 100 if done else min(int(ratio * 100), 99)
+            filled = percent // 10
+            bar = "[" + "#" * filled + "-" * (10 - filled) + f"] {percent:3d}%"
+            count = f"{self.files}/{self.total_files} 个文件"
+        line = f"{bar} {self.label} | {count} {self.bytes / (1024 * 1024):.1f} MiB | {int(now - self.started)}s"
+        if self.terminal:
+            print("\r" + line + " " * max(0, self.width - len(line)), end="", file=self.stream, flush=True)
+            self.width = len(line)
+        else:
+            print(line, file=self.stream, flush=True)
 
 
 def fs_path(path):
@@ -82,48 +164,84 @@ def is_link(path):
     return False
 
 
-def inventory(path):
-    """Exact file hashes + empty directories; refuse links/reparse points before copying."""
+def inventory(path, *, follow_links=False, forbidden=None, progress=None):
+    """Hash contents; only read-only backup scans may follow nested links."""
     path = fs_path(path)
     if is_link(path):
         raise MaintenanceError(f"拒绝操作符号链接或目录联接: {path}")
     if not path.exists():
         return None
     result = {}
-    nodes = [path]
+    nodes = [(path, frozenset())]
     while nodes:
-        node = nodes.pop()
+        node, ancestors = nodes.pop()
+        if progress is not None:
+            progress.advance()
         if is_link(node):
-            raise MaintenanceError(f"数据中存在链接，请先移到普通目录: {node}")
+            if not follow_links:
+                raise MaintenanceError(f"数据中存在链接，请先移到普通目录: {node}")
+            # Do not treat arbitrary Windows reparse points as ordinary links.
+            if not node.is_symlink() and not (os.name == "nt" and
+                    getattr(node.lstat(), "st_reparse_tag", 0) == 0xA0000003):
+                raise MaintenanceError(f"不支持的重解析点: {node}")
+            try:
+                node.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise MaintenanceError(f"链接失效或形成循环，无法完整备份: {node}") from exc
+            if forbidden is not None and node.is_dir() and inside(fs_path(forbidden), node):
+                raise MaintenanceError(f"链接指向备份目录或其上级，无法备份: {node}")
         rel = node.relative_to(path).as_posix()
         if node.is_dir():
+            stat = node.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in ancestors:
+                raise MaintenanceError(f"目录链接形成循环，无法完整备份: {node}")
             result[rel] = None
-            nodes.extend(node.iterdir())
+            branch = ancestors | {identity}
+            nodes.extend((child, branch) for child in node.iterdir())
         elif node.is_file():
             digest = hashlib.sha256()
             with node.open("rb") as stream:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
+                    if progress is not None:
+                        progress.advance(size=len(block))
             result[rel] = digest.hexdigest()
+            if progress is not None:
+                progress.advance(files=1)
         else:
             raise MaintenanceError(f"不支持的文件类型: {node}")
     return result
 
 
-def copy_path(source, target):
+def copy_path(source, target, *, follow_source_links=False, progress=None, totals=(None, None)):
     source, target = fs_path(source), fs_path(target)
     # Recheck links here, including destination ancestors, before any writes.
-    inventory(source)
+    with progress.phase("复制前复查", *totals) if progress else contextlib.nullcontext():
+        inventory(source, follow_links=follow_source_links, forbidden=target, progress=progress)
     for parent in [target, *target.parents]:
         if is_link(parent):
             raise MaintenanceError(f"目标路径包含链接: {parent}")
-    if source.is_dir():
-        if target.exists():
-            inventory(target)
-        shutil.copytree(source, target, dirs_exist_ok=True)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+    def copy_file(src, dst):
+        if progress is None:
+            return shutil.copy2(src, dst)
+        # Report bytes within large files too, rather than waiting for copy2 to return.
+        with open(src, "rb") as reader, open(dst, "wb") as writer:
+            for block in iter(lambda: reader.read(1024 * 1024), b""):
+                writer.write(block)
+                progress.advance(size=len(block))
+        shutil.copystat(src, dst)
+        progress.advance(files=1)
+        return dst
+
+    with progress.phase("复制文件", *totals) if progress else contextlib.nullcontext():
+        if source.is_dir():
+            if target.exists():
+                inventory(target)
+            shutil.copytree(source, target, dirs_exist_ok=True, copy_function=copy_file)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(source, target)
 
 
 def remove_path(path, allowed, allow_nested_links=False):
@@ -266,20 +384,32 @@ def new_archive(env, prefix):
 
 
 def backup(env, prefix="backup"):
+    print("正在检查运行状态，准备完整备份…", flush=True)
     require_closed(env)
     root = new_archive(env, prefix)
     entries = {}
+    progress = BackupProgress()
     for key, source in env.data.items():
-        before = inventory(source)
+        if not source.exists() and not is_link(source):
+            continue
+        print(f"\n正在备份: {source}", flush=True)
+        with progress.phase("扫描源文件"):
+            before = inventory(source, follow_links=True, forbidden=env.backup_root, progress=progress)
         if before is None:
             continue
+        totals = (progress.files, progress.bytes)
         target = root / "payload" / key
-        copy_path(source, target)
-        if inventory(target) != before or inventory(source) != before:
-            raise MaintenanceError(f"备份期间文件发生变化，备份无效: {source}")
+        copy_path(source, target, follow_source_links=True, progress=progress, totals=totals)
+        with progress.phase("校验备份", *totals):
+            if inventory(target, progress=progress) != before:
+                raise MaintenanceError(f"备份期间文件发生变化，备份无效: {source}")
+        with progress.phase("复查源文件", *totals):
+            if inventory(source, follow_links=True, forbidden=env.backup_root, progress=progress) != before:
+                raise MaintenanceError(f"备份期间文件发生变化，备份无效: {source}")
         entries[key] = {"source": str(source), "files": before}
     if not entries:
         raise MaintenanceError("没有找到 Claude 数据，未生成有效备份。")
+    print("正在保存备份清单…", flush=True)
     write_json(root / "manifest.json", {"format": 2, "kind": "full", "version": VERSION,
                "home": str(env.home), "system": env.system, "entries": entries})
     print(f"完整备份完成（SHA-256 校验）: {root}")
@@ -319,7 +449,8 @@ def validate_backup(env, root, fresh=False):
             raise MaintenanceError("备份清单结构异常。")
         if inventory(root / "payload" / key) != entry.get("files"):
             raise MaintenanceError(f"备份文件缺失或校验失败: {key}")
-        if fresh and (entry.get("source") != str(env.data[key]) or inventory(env.data[key]) != entry["files"]):
+        if fresh and (entry.get("source") != str(env.data[key]) or
+                      inventory(env.data[key], follow_links=True, forbidden=env.backup_root) != entry["files"]):
             raise MaintenanceError("本机数据已变化，必须重新完整备份后再删除。")
     if fresh:
         for key, path in env.data.items():
@@ -829,6 +960,7 @@ def dispatch(env, command, requested=None, account=None, scan=False, keep_histor
         raise MaintenanceError(f'未知操作: {command}。可用命令: backup / clean / restore / sessions / verify')
 
 
+@console_selection()
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -850,6 +982,8 @@ def main(argv=None):
             else:
                 while True:
                     print(MENU)
+                    if os.name == "nt":
+                        print("拖动鼠标选中，按 Enter 复制；右键粘贴。选中时暂停输出，Esc 取消选中。")
                     choice = input("请选择: ").strip()
                     if choice == "0":
                         return 0

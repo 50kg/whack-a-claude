@@ -6,7 +6,9 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -145,6 +147,120 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn('claude', manifest['entries'])
         self.assertIn('data-0', manifest['entries'])
         self.assertEqual((first / 'payload/claude/skills/custom/SKILL.md').read_text(encoding='utf-8'), '测试内容')
+
+    def test_backup_reports_each_stage_and_preserves_large_file(self):
+        content = b'chunk' * 500000
+        source = self.put('.claude/projects/large.jsonl', '')
+        source.write_bytes(content)
+        self.put('.claude/projects/empty.jsonl', '')
+        root = app.backup(self.env)
+        app.validate_backup(self.env, root, fresh=True)
+        output = self.stdout._new_target.getvalue()
+        for stage in ('扫描源文件', '复制前复查', '复制文件', '校验备份', '复查源文件'):
+            self.assertIn(stage, output)
+        self.assertIn('2/2 个文件 2.4 MiB', output)
+        self.assertIn('100%', output)
+        self.assertNotIn('\r', output)
+        self.assertLess(output.index('复查源文件'), output.index('完整备份完成'))
+        self.assertEqual((root / 'payload/claude/projects/large.jsonl').read_bytes(), content)
+
+    def test_inventory_progress_updates_within_a_large_file(self):
+        source = self.put('.claude/projects/large.jsonl', '')
+        source.write_bytes(b'x' * (2 * 1024 * 1024 + 17))
+        events = []
+        class Reporter:
+            def advance(self, **counts):
+                events.append(counts)
+        app.inventory(source, progress=Reporter())
+        sizes = [event['size'] for event in events if 'size' in event]
+        self.assertEqual(sizes, [1024 * 1024, 1024 * 1024, 17])
+        self.assertEqual(sum(event.get('files', 0) for event in events), 1)
+
+    def test_terminal_progress_throttles_and_finishes_on_new_line(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        stream = Terminal()
+        with patch.object(app.sys, 'stdout', stream), patch.object(app.time, 'monotonic', return_value=10):
+            progress = app.BackupProgress()
+            with progress.phase('复制文件', 100, 100):
+                for _ in range(100):
+                    progress.advance(files=1, size=1)
+        output = stream.getvalue()
+        self.assertEqual(output.count('\r'), 2)
+        self.assertIn('100%', output)
+        self.assertTrue(output.endswith('\n'))
+
+    def test_failed_progress_never_reports_success_and_ends_on_new_line(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        stream = Terminal()
+        with patch.object(app.sys, 'stdout', stream):
+            progress = app.BackupProgress()
+            with self.assertRaises(OSError):
+                with progress.phase('复制文件', 1, 1):
+                    progress.advance(files=1, size=1)
+                    raise OSError('disk full')
+        self.assertNotIn('100%', stream.getvalue())
+        self.assertTrue(stream.getvalue().endswith('\n'))
+
+    def test_failed_streaming_copy_does_not_mark_backup_complete(self):
+        self.put('.claude/settings.json', '{}')
+        advance = app.BackupProgress.advance
+        def fail_during_copy(progress, **counts):
+            advance(progress, **counts)
+            if progress.label == '复制文件' and counts.get('size'):
+                raise OSError('disk full')
+        with patch.object(app.BackupProgress, 'advance', fail_during_copy):
+            with self.assertRaises(OSError):
+                app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+        output = self.stdout._new_target.getvalue()
+        self.assertNotIn('完整备份完成', output)
+        self.assertNotIn('100%', output[output.index('复制文件'):])
+
+    def test_console_selection_ignores_redirected_input(self):
+        with patch.object(app.sys, 'stdin', io.StringIO()):
+            with app.console_selection() as enabled:
+                self.assertFalse(enabled)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows console modes only')
+    def test_console_selection_enables_quick_edit_and_restores_original_mode(self):
+        report = self.home / 'console-mode.json'
+        code = textwrap.dedent('''
+            import ctypes
+            from ctypes import wintypes
+            import json
+            import sys
+            import whack_a_claude as app
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+            kernel.GetStdHandle.restype = wintypes.HANDLE
+            kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            handle = kernel.GetStdHandle(-10)
+            def mode():
+                value = wintypes.DWORD()
+                assert kernel.GetConsoleMode(handle, ctypes.byref(value))
+                return value.value
+            assert kernel.SetConsoleMode(handle, (mode() | 0x80) & ~0x40)
+            before = mode()
+            with app.console_selection() as enabled:
+                during = mode()
+            with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+                json.dump({'enabled': enabled, 'before': before, 'during': during, 'after': mode()}, stream)
+        ''')
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = subprocess.SW_HIDE
+        subprocess.run([sys.executable, '-c', code, str(report)], check=True, timeout=30,
+                       cwd=Path(app.__file__).resolve().parent, startupinfo=startup,
+                       creationflags=subprocess.CREATE_NEW_CONSOLE)
+        data = app.read_json(report)
+        self.assertTrue(data['enabled'])
+        self.assertEqual(data['during'], data['before'] | 0xC0)
+        self.assertEqual(data['after'], data['before'])
 
     def test_empty_profile_refuses_completed_backup(self):
         with self.assertRaises(app.MaintenanceError):
@@ -475,6 +591,131 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaises(app.MaintenanceError):
             app.backup(self.env)
         self.assertTrue((self.home / 'outside/data').exists())
+
+    def make_link(self, link, target, directory=True, junction=False):
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if not junction:
+            try:
+                link.symlink_to(target, target_is_directory=directory)
+                return
+            except OSError:
+                if os.name != 'nt' or not directory:
+                    self.skipTest('Symlink privilege unavailable')
+        result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)], capture_output=True)
+        if result.returncode:
+            self.skipTest('Junction privilege unavailable')
+
+    def test_backup_materializes_linked_skill_and_restores_without_target(self):
+        external = self.put('shared skills/ego-browser/SKILL.md', 'linked skill')
+        self.put('shared skills/ego-browser/empty/.keep')
+        external.parent.joinpath('empty/.keep').unlink()
+        link = self.home / '.claude/skills/ego-browser'
+        self.make_link(link, external.parent)
+        root = app.backup(self.env)
+        saved = root / 'payload/claude/skills/ego-browser'
+        self.assertFalse(app.is_link(saved))
+        self.assertEqual((saved / 'SKILL.md').read_text(), 'linked skill')
+        self.assertTrue((saved / 'empty').is_dir())
+        app.validate_backup(self.env, root, fresh=True)
+        # Remove only the fixture link, then make its original target unavailable.
+        if link.is_symlink():
+            link.unlink()
+        else:
+            link.rmdir()
+        external.unlink()
+        app.restore(self.env, root)
+        self.assertFalse(app.is_link(link))
+        self.assertEqual((link / 'SKILL.md').read_text(), 'linked skill')
+        self.assertFalse(external.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions only')
+    def test_backup_materializes_windows_junction(self):
+        external = self.put('junction target/SKILL.md', 'junction skill')
+        link = self.home / '.claude/skills/ego-browser'
+        self.make_link(link, external.parent, junction=True)
+        root = app.backup(self.env)
+        app.validate_backup(self.env, root, fresh=True)
+        saved = root / 'payload/claude/skills/ego-browser'
+        self.assertFalse(app.is_link(saved))
+        self.assertEqual((saved / 'SKILL.md').read_text(), 'junction skill')
+        self.assertEqual(external.read_text(), 'junction skill')
+
+    def test_backup_materializes_file_link(self):
+        external = self.put('shared settings.json', '{"keep":true}')
+        self.make_link(self.home / '.claude/settings.json', external, directory=False)
+        root = app.backup(self.env)
+        app.validate_backup(self.env, root, fresh=True)
+        saved = root / 'payload/claude/settings.json'
+        self.assertFalse(app.is_link(saved))
+        self.assertEqual(app.read_json(saved), {'keep': True})
+
+    def test_backup_allows_multiple_links_to_same_directory(self):
+        external = self.put('shared/SKILL.md')
+        for name in ('one', 'two'):
+            self.make_link(self.home / '.claude/skills' / name, external.parent)
+        root = app.backup(self.env)
+        app.validate_backup(self.env, root, fresh=True)
+        for name in ('one', 'two'):
+            self.assertTrue((root / 'payload/claude/skills' / name / 'SKILL.md').is_file())
+
+    def test_backup_rejects_directory_link_cycle(self):
+        self.put('.claude/settings.json', '{}')
+        self.make_link(self.home / '.claude/skills/loop', self.home / '.claude')
+        with self.assertRaisesRegex(app.MaintenanceError, '循环'):
+            app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+
+    def test_backup_rejects_dangling_link(self):
+        self.make_link(self.home / '.claude/skills/missing', self.home / 'missing')
+        with self.assertRaisesRegex(app.MaintenanceError, '失效'):
+            app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+
+    def test_backup_rejects_link_to_backup_parent(self):
+        self.make_link(self.home / '.claude/skills/parent', self.home)
+        with self.assertRaisesRegex(app.MaintenanceError, '备份目录'):
+            app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+
+    def test_backup_rejects_link_to_backup_root(self):
+        self.env.backup_root.mkdir()
+        self.make_link(self.home / '.claude/skills/backup', self.env.backup_root)
+        with self.assertRaisesRegex(app.MaintenanceError, '备份目录'):
+            app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+
+    def test_link_target_change_during_copy_prevents_completed_backup(self):
+        external = self.put('shared/SKILL.md', 'before')
+        self.make_link(self.home / '.claude/skills/shared', external.parent)
+        original = app.copy_path
+        def copy_then_change(*args, **kwargs):
+            original(*args, **kwargs)
+            external.write_text('after')
+        with patch.object(app, 'copy_path', side_effect=copy_then_change):
+            with self.assertRaisesRegex(app.MaintenanceError, '备份期间文件发生变化'):
+                app.backup(self.env)
+        self.assertFalse(list(self.env.backup_root.glob('*/manifest.json')))
+
+    def test_linked_source_still_refused_for_writes_and_deletes(self):
+        external = self.put('shared/SKILL.md', 'keep')
+        link = self.home / '.claude/skills/shared'
+        self.make_link(link, external.parent)
+        with self.assertRaises(app.MaintenanceError):
+            app.remove_path(self.home / '.claude', {self.home / '.claude'})
+        with self.assertRaises(app.MaintenanceError):
+            app.copy_path(self.home / '.claude', self.home / 'copy')
+        with self.assertRaises(app.MaintenanceError):
+            app.copy_path(external, link / 'SKILL.md')
+        self.assertEqual(external.read_text(), 'keep')
+
+    def test_backup_freshness_checks_link_target_contents(self):
+        external = self.put('shared/SKILL.md', 'before')
+        self.make_link(self.home / '.claude/skills/shared', external.parent)
+        root = app.backup(self.env)
+        external.write_text('after')
+        app.validate_backup(self.env, root)
+        with self.assertRaises(app.MaintenanceError):
+            app.validate_backup(self.env, root, fresh=True)
 
     def test_runtime_rejects_running_process(self):
         self.closed.stop()
